@@ -1,0 +1,349 @@
+// Prisma schema for the SaaS Subscription Management Platform.
+// Run `npm run db:push` (dev) or `npm run db:migrate` (prod) after editing.
+
+// Prisma 7: the connection URL lives in `prisma.config.ts` (used by the CLI)
+// and is supplied to the client at runtime via the pg driver adapter.
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum Role {
+  OWNER // full control incl. billing + org deletion
+  ADMIN // manage members, plans preview, all reports
+  BILLING // manage plans, invoices, payment methods
+  MEMBER // consume product, view own usage
+  VIEWER // read-only analytics
+}
+
+enum SubscriptionStatus {
+  TRIALING
+  ACTIVE
+  PAST_DUE
+  UNPAID
+  CANCELED
+  INCOMPLETE
+  INCOMPLETE_EXPIRED
+  PAUSED
+}
+
+enum BillingInterval {
+  MONTHLY
+  YEARLY
+}
+
+enum InvoiceStatus {
+  DRAFT
+  OPEN
+  PAID
+  VOID
+  UNCOLLECTIBLE
+}
+
+enum PaymentStatus {
+  SUCCEEDED
+  PENDING
+  FAILED
+  REFUNDED
+}
+
+enum WebhookStatus {
+  PENDING
+  PROCESSED
+  FAILED
+  IGNORED
+}
+
+// ---------------------------------------------------------------------------
+// Tenancy & identity
+// ---------------------------------------------------------------------------
+
+model Organization {
+  id        String   @id @default(cuid())
+  name      String
+  slug      String   @unique
+  logoUrl   String?
+  timezone  String   @default("UTC")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  users         User[]
+  subscriptions Subscription[]
+  invoices      Invoice[]
+  usageRecords  UsageRecord[]
+  auditLogs     AuditLog[]
+
+  @@index([createdAt])
+}
+
+model User {
+  id             String   @id @default(cuid())
+  email          String   @unique
+  name           String?
+  passwordHash   String
+  role           Role     @default(MEMBER)
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  isActive       Boolean  @default(true)
+  emailVerified  DateTime?
+  lastLoginAt    DateTime?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  sessions Session[]
+  accounts Account[]
+
+  @@index([organizationId])
+  @@index([role])
+}
+
+model Session {
+  sessionToken String   @unique
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expires      DateTime
+
+  @@index([userId])
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  user              User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String?
+  access_token      String?
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?
+  session_state     String?
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+// ---------------------------------------------------------------------------
+// Catalog
+// ---------------------------------------------------------------------------
+
+model Plan {
+  id            String   @id @default(cuid())
+  code          String   @unique // e.g. "starter", "growth", "scale"
+  name          String
+  description   String?
+  // Stripe mapping — a plan is a product with one price per interval.
+  stripeProductId String?
+  stripePriceIdMonthly String?
+  stripePriceIdYearly  String?
+
+  amountCents   Int      // per interval, in `currency`
+  currency      String   @default("usd")
+  interval      BillingInterval @default(MONTHLY)
+  trialDays     Int      @default(14)
+
+  // Marketing copy + metering limits, stored as JSON for flexibility.
+  // e.g. features: ["Unlimited projects"], limits: { seats: 5, apiCalls: 100000 }
+  features      Json     @default("[]")
+  limits        Json     @default("{}")
+
+  isPopular     Boolean  @default(false)
+  isActive      Boolean  @default(true)
+  sortOrder     Int      @default(0)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  subscriptions Subscription[]
+
+  @@index([isActive, sortOrder])
+}
+
+// ---------------------------------------------------------------------------
+// Billing
+// ---------------------------------------------------------------------------
+
+model Subscription {
+  id                   String             @id @default(cuid())
+  organizationId       String
+  organization         Organization       @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  planId               String
+  plan                 Plan               @relation(fields: [planId], references: [id])
+  stripeSubscriptionId String?            @unique
+  stripeCustomerId     String?
+
+  status               SubscriptionStatus @default(INCOMPLETE)
+  interval             BillingInterval    @default(MONTHLY)
+  seats                Int                @default(1)
+
+  currentPeriodStart   DateTime?
+  currentPeriodEnd     DateTime?
+  trialEndsAt          DateTime?
+  cancelAtPeriodEnd    Boolean            @default(false)
+  canceledAt           DateTime?
+  endedAt              DateTime?
+
+  // Pending change from an upgrade/downgrade, applied at period end.
+  pendingPlanId        String?
+  pendingInterval      BillingInterval?
+
+  createdAt            DateTime           @default(now())
+  updatedAt            DateTime           @updatedAt
+
+  invoices Invoice[]
+
+  @@index([organizationId])
+  @@index([status])
+  @@index([planId])
+}
+
+model PaymentMethod {
+  id                   String   @id @default(cuid())
+  organizationId       String
+  stripeCustomerId     String
+  stripePaymentMethodId String  @unique
+  brand                String?
+  last4                String?
+  expMonth             Int?
+  expYear              Int?
+  isDefault            Boolean  @default(false)
+  createdAt            DateTime @default(now())
+
+  @@index([organizationId])
+}
+
+model Invoice {
+  id               String        @id @default(cuid())
+  organizationId   String
+  organization     Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  subscriptionId   String?
+  subscription     Subscription? @relation(fields: [subscriptionId], references: [id], onDelete: SetNull)
+  stripeInvoiceId  String?       @unique
+  number           String?       // human readable, e.g. "INV-0001"
+  status           InvoiceStatus @default(DRAFT)
+  currency         String        @default("usd")
+  subtotalCents    Int           @default(0)
+  discountCents    Int           @default(0)
+  taxCents         Int           @default(0)
+  totalCents       Int           @default(0)
+  amountPaidCents  Int           @default(0)
+  amountDueCents   Int           @default(0)
+  billingReason    String?
+  periodStart      DateTime?
+  periodEnd        DateTime?
+  dueDate          DateTime?
+  paidAt           DateTime?
+  hostedInvoiceUrl String?
+  invoicePdfUrl    String?
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+
+  lineItems InvoiceLineItem[]
+
+  @@index([organizationId, createdAt])
+  @@index([status])
+}
+
+model InvoiceLineItem {
+  id          String   @id @default(cuid())
+  invoiceId   String
+  invoice     Invoice  @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  description String
+  quantity    Int      @default(1)
+  unitCents   Int      @default(0)
+  amountCents Int      @default(0)
+  periodStart DateTime?
+  periodEnd   DateTime?
+  metadata    Json     @default("{}")
+
+  @@index([invoiceId])
+}
+
+model Payment {
+  id              String        @id @default(cuid())
+  organizationId  String
+  invoiceId       String?
+  stripePaymentIntentId String?  @unique
+  amountCents     Int
+  currency        String        @default("usd")
+  status          PaymentStatus @default(PENDING)
+  failureMessage  String?
+  createdAt       DateTime      @default(now())
+
+  @@index([organizationId, createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Usage metering
+// ---------------------------------------------------------------------------
+
+model UsageRecord {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  metric         String // e.g. "api_calls", "seats", "storage_gb"
+  quantity       Int          @default(0)
+  periodStart    DateTime
+  periodEnd      DateTime
+  source         String       @default("api")
+  metadata       Json         @default("{}")
+  createdAt      DateTime     @default(now())
+
+  // One row per organization + metric + day + source, so usage reports can
+  // be retried without double-counting.
+  @@unique([organizationId, metric, periodStart, source], name: "usage_daily_key")
+  @@index([organizationId, metric, periodStart])
+  @@index([periodEnd])
+}
+
+// ---------------------------------------------------------------------------
+// Platform plumbing
+// ---------------------------------------------------------------------------
+
+// Idempotency ledger for Stripe webhooks.
+model WebhookEvent {
+  id            String        @id @default(cuid())
+  stripeEventId String        @unique
+  type          String
+  status        WebhookStatus @default(PENDING)
+  payload       Json
+  error         String?
+  attempts      Int           @default(0)
+  receivedAt    DateTime      @default(now())
+  processedAt   DateTime?
+
+  @@index([status])
+}
+
+model AuditLog {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  actorId        String?
+  actorEmail     String?
+  action         String // e.g. "subscription.upgraded"
+  targetType     String?
+  targetId       String?
+  metadata       Json         @default("{}")
+  ipAddress      String?
+  createdAt      DateTime     @default(now())
+
+  @@index([organizationId, createdAt])
+  @@index([action])
+}
