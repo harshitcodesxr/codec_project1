@@ -7,6 +7,7 @@ import {
   getUsageSeries,
   getUsageSummary,
   getRevenueSeries,
+  totalSeries,
   METRICS,
 } from "@/lib/usage";
 import { formatMoney } from "@/lib/plans";
@@ -42,15 +43,9 @@ export default async function UsagePage({
     getRevenueSeries(user.organizationId, 6),
   ]);
 
-  const totals = series.reduce(
-    (acc, point) => {
-      for (const m of METRICS) {
-        acc[m.key] += Number(point[m.key] ?? 0);
-      }
-      return acc;
-    },
-    Object.fromEntries(METRICS.map((m) => [m.key, 0])) as Record<string, number>,
-  );
+  // Flows accumulate across the window; gauges report their latest reading,
+  // so "totals" here deliberately is not a plain sum of every column.
+  const totals = totalSeries(series);
 
   const collected = revenue.reduce((sum, r) => sum + r.mrrCents, 0);
 
@@ -117,7 +112,7 @@ export default async function UsagePage({
 
       <Card
         title="Totals for the selected window"
-        description="Summed across every metric"
+        description="API calls are summed across the window; storage, projects and seats show the latest reading"
       >
         {days === 0 ? (
           <EmptyState>No data.</EmptyState>

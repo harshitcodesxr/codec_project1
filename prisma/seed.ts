@@ -212,8 +212,8 @@ async function main() {
   }
 
   console.log("Seeding usage records…");
-  await seedUsage(acme.id, growthPlanId, 30, 7_500);
-  await seedUsage(globex.id, plans.get("scale-annual")!, 30, 26_000);
+  await seedUsage(acme.id, growthPlanId, 30, 7_500, 4);
+  await seedUsage(globex.id, plans.get("scale-annual")!, 30, 26_000, 12);
 
   console.log("Seeding invoices…");
   await seedInvoices(acme.id, 2900);
@@ -264,20 +264,36 @@ function daysFromNow(n: number) {
   return d;
 }
 
-/** One usage row per day per metric, shaped like real production traffic. */
+/**
+ * One usage row per day per metric, shaped like real production traffic.
+ *
+ * The four metrics measure different things, so they get different shapes:
+ * `api_calls` is a daily flow that tracks the caller's volume, `storage_gb`
+ * is a slow-growing balance, and `projects`/`seats` are gauges that barely
+ * move. Giving them all the same magnitude produced nonsense like
+ * "78,432 seats" against a 5-seat plan.
+ *
+ * @param dailyApiCalls average API requests per weekday
+ * @param seats         the subscription's seat count, which drives the seat gauge
+ */
 async function seedUsage(
   organizationId: string,
   planId: string,
   days: number,
-  dailyAverage: number,
+  dailyApiCalls: number,
+  seats: number,
 ) {
   const plan = await prisma.plan.findUnique({ where: { id: planId } });
   const limits = (plan?.limits ?? {}) as Record<string, number>;
 
-  const metrics = ["api_calls", "storage_gb", "projects", "seats"];
   const rand = seededRandom(
     organizationId.split("").reduce((a, c) => a + c.charCodeAt(0), 0),
   );
+
+  // `0` means "unlimited" in the catalog, so fall back to a large but finite
+  // target — a gauge still needs an absolute number to report.
+  const storageTarget = limits.storage_gb > 0 ? limits.storage_gb * 0.78 : 320;
+  const projectTarget = limits.projects > 0 ? limits.projects * 0.6 : 9;
 
   for (let i = days; i >= 0; i--) {
     const start = daysAgo(i);
@@ -285,15 +301,39 @@ async function seedUsage(
     const end = new Date(start);
     end.setDate(end.getDate() + 1);
 
-    for (const metric of metrics) {
-      // Weekday traffic is higher; add mild noise for a realistic curve.
-      const weekday = start.getDay() % 6 !== 0;
-      const base = weekday ? dailyAverage : dailyAverage * 0.55;
-      const quantity = Math.max(
-        0,
-        Math.round(base * (0.75 + rand() * 0.5)),
-      );
+    // 0 at the oldest day, 1 today — storage fills up, gauges settle.
+    const progress = 1 - i / days;
 
+    // Weekday traffic is higher; weekends drop off. Mild noise keeps the
+    // curve from looking synthetic.
+    const weekday = start.getDay() % 6 !== 0;
+    const apiCalls = Math.max(
+      0,
+      Math.round(
+        (weekday ? dailyApiCalls : dailyApiCalls * 0.55) * (0.75 + rand() * 0.5),
+      ),
+    );
+
+    // Storage creeps up towards the target instead of jumping around.
+    const storage = Math.round(
+      (storageTarget * (0.55 + 0.45 * progress)) * (0.97 + rand() * 0.06),
+    );
+
+    // Gauges: integer counts, ±1 so they look alive without being noisy.
+    const projects = Math.max(
+      1,
+      Math.round(projectTarget * (0.8 + 0.2 * progress)) + (rand() > 0.8 ? 1 : 0),
+    );
+    const seatGauge = Math.max(1, seats + (rand() > 0.85 ? 1 : 0) - (rand() > 0.9 ? 1 : 0));
+
+    const rows: Array<{ metric: string; quantity: number }> = [
+      { metric: "api_calls", quantity: apiCalls },
+      { metric: "storage_gb", quantity: storage },
+      { metric: "projects", quantity: projects },
+      { metric: "seats", quantity: seatGauge },
+    ];
+
+    for (const { metric, quantity } of rows) {
       await prisma.usageRecord.upsert({
         where: {
           usage_daily_key: {

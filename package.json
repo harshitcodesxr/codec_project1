@@ -10,6 +10,7 @@
     "typecheck": "tsc --noEmit",
     "smoke": "node scripts/smoke.mjs",
     "smoke:api": "node scripts/api-smoke.mjs",
+    "test:usage": "tsx scripts/usage-agg.test.ts",
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev",
     "db:deploy": "prisma migrate deploy",

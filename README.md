@@ -170,6 +170,27 @@ JWT expires.
   collected revenue per month, and limit meters.
 - `/dashboard` summarises the current billing period.
 
+#### Usage accounting
+
+Not every metered quantity behaves the same way, so each metric declares how
+its daily rows combine into a period total (`src/lib/plans.ts`):
+
+| Metric | Aggregation | Why |
+| --- | --- | --- |
+| `api_calls` | `sum` | A flow. Each day's row is that day's request count. |
+| `storage_gb` | `last` | A balance. Each row is the GB stored *at that moment*. |
+| `projects` | `last` | A gauge — a count at a point in time. |
+| `seats` | `last` | A gauge — a count at a point in time. |
+
+Summing a gauge multiplies it by the number of days in the period, which is
+how a 19 GB reading became "215 GB used against a 25 GB limit". `getUsageTotals`
+and `totalSeries` both respect this, and `npm run test:usage` locks it in.
+
+A consequence worth knowing: because a gauge is absolute per day, reporting
+`storage_gb` through `POST /api/usage` overwrites that day's reading rather
+than adding to it, while a second `source` for the same day is kept as a
+separate row and the newest one wins.
+
 ### 4. Admin console
 
 `/admin` — platform-wide view: MRR, active subscriptions, plan distribution,
@@ -267,6 +288,7 @@ In production, the app runs behind the Stripe API version pinned in
 | `npm run setup` | generate + deploy + seed |
 | `npm run smoke` | Sign in as every seeded role, print the HTTP status of every route |
 | `npm run smoke:api` | Exercise the mutating route handlers and their guards |
+| `npm run test:usage` | Assert flow metrics sum and gauge metrics read latest |
 
 ### Smoke tests
 
@@ -282,6 +304,10 @@ anonymous callers, that metered quantities are absolute (a retried request
 overwrites rather than accumulating), that validation rejects bad batches, that
 organizations cannot overwrite each other's usage, and that the cron and
 webhook endpoints refuse unauthenticated calls. It cleans up after itself.
+
+`npm run test:usage` covers the aggregation rule described in
+[Usage accounting](#usage-accounting), including the case where two sources
+report the same metric on the same day.
 
 ---
 

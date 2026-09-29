@@ -1,8 +1,11 @@
 import { prisma } from "@/lib/prisma";
-import { METRICS, type MetricKey } from "@/lib/plans";
+import { METRICS, isFlowMetric, type MetricKey } from "@/lib/plans";
 
 export { METRICS };
 export type { MetricKey };
+
+/** Metrics whose daily rows are deltas and therefore accumulate. */
+const FLOW_METRICS = METRICS.filter((m) => m.agg === "sum").map((m) => m.key);
 
 export type UsageSummary = {
   metric: string;
@@ -36,24 +39,48 @@ export function lastNDays(days: number, from = new Date()) {
   return { start, end };
 }
 
-/** Aggregates all metrics for one period, in a single query. */
+/**
+ * Aggregates all metrics for one period.
+ *
+ * Flow metrics are summed; balance/gauge metrics take the most recent daily
+ * reading, because adding up 13 daily storage snapshots would report
+ * thirteen times the storage actually in use.
+ */
 export async function getUsageTotals(
   organizationId: string,
   start: Date,
   end: Date,
 ): Promise<Record<string, number>> {
-  const rows = await prisma.usageRecord.groupBy({
-    by: ["metric"],
-    where: {
-      organizationId,
-      periodStart: { gte: start, lt: end },
-    },
-    _sum: { quantity: true },
-  });
+  const where = {
+    organizationId,
+    periodStart: { gte: start, lt: end },
+  };
 
-  return Object.fromEntries(
-    rows.map((r) => [r.metric, r._sum.quantity ?? 0]),
+  const [summed, latest] = await Promise.all([
+    // Flows: one grouped sum per metric.
+    prisma.usageRecord.groupBy({
+      by: ["metric"],
+      where: { ...where, metric: { in: FLOW_METRICS } },
+      _sum: { quantity: true },
+    }),
+    // Gauges: the newest row per metric. Ordered ascending so the last
+    // row seen for a metric is the one kept.
+    prisma.usageRecord.findMany({
+      where: { ...where, metric: { notIn: FLOW_METRICS } },
+      select: { metric: true, quantity: true },
+      orderBy: { periodStart: "asc" },
+    }),
+  ]);
+
+  const totals: Record<string, number> = Object.fromEntries(
+    summed.map((r) => [r.metric, r._sum.quantity ?? 0]),
   );
+
+  for (const row of latest) {
+    totals[row.metric] = row.quantity;
+  }
+
+  return totals;
 }
 
 /** Usage vs. plan limits, for the meters on the dashboard. */
@@ -117,12 +144,36 @@ export async function getUsageSeries(
   for (const r of records) {
     const key = r.periodStart.toISOString().slice(0, 10);
     const point = buckets.get(key);
-    if (point) {
-      point[r.metric] = (point[r.metric] as number) + r.quantity;
-    }
+    if (!point) continue;
+
+    // Several sources can report the same metric on the same day. Flows add
+    // up; a gauge is a reading, so the last report wins rather than
+    // double-counting one gauge against itself.
+    point[r.metric] = isFlowMetric(r.metric)
+      ? (point[r.metric] as number) + r.quantity
+      : r.quantity;
   }
 
   return [...buckets.values()];
+}
+
+/**
+ * Reduces a daily series into window totals, honouring each metric's
+ * aggregation: flows add up, balances and gauges report their latest reading.
+ */
+export function totalSeries(series: UsagePoint[]): Record<string, number> {
+  const totals = Object.fromEntries(
+    METRICS.map((m) => [m.key, 0]),
+  ) as Record<string, number>;
+
+  for (const point of series) {
+    for (const m of METRICS) {
+      const value = Number(point[m.key] ?? 0);
+      totals[m.key] = m.agg === "sum" ? totals[m.key] + value : value;
+    }
+  }
+
+  return totals;
 }
 
 export type RevenuePoint = { month: string; mrrCents: number };
