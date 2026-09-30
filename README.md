@@ -270,6 +270,51 @@ In production, the app runs behind the Stripe API version pinned in
 
 ---
 
+## Deploying
+
+**This app cannot run on GitHub Pages.** Pages serves static files only — no
+Node process. SubPilot needs a live Node runtime (Server Actions and the route
+handlers under `src/app/api/`), a reachable PostgreSQL database, and a session
+cookie round-trip for sign-in. If you enable Pages on this repo, Jekyll finds no
+`index.html`, converts `README.md` into one, and publishes the documentation as
+the "site". That is not a broken deploy — it is the wrong hosting model.
+
+Deploy to a platform that runs Node and provides Postgres:
+
+| Piece | Where | Notes |
+| --- | --- | --- |
+| App | Vercel, Render, Railway, Fly.io | Connect the GitHub repo; the build needs no extra config |
+| Database | Neon, Supabase, Vercel Postgres | Any hosted Postgres — a `postgres://` connection string |
+| Secrets | Platform env vars | `DATABASE_URL`, `AUTH_SECRET`, `CRON_SECRET` |
+
+`vercel.json` already declares the billing cron (`/api/cron/billing`, daily at
+03:17). On Vercel, note that cron jobs require the account to be on a plan that
+includes them.
+
+Then, against the hosted database:
+
+```bash
+npm run db:generate
+npm run db:deploy    # prisma migrate deploy - applies committed migrations
+npm run db:seed      # optional: demo plans, orgs, users, 30 days of usage
+```
+
+Generate `AUTH_SECRET` fresh for the deployment — do not reuse a local value:
+
+```bash
+node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
+```
+
+Two things that bite on a cold clone:
+
+- **`package.json` must keep its `postinstall: prisma generate`.** Without it a
+  fresh `npm install` leaves `@prisma/client` ungenerated and `next build` fails
+  before it starts.
+- **A local `DATABASE_URL` is useless in production.** The Postgres used for
+  development is bound to `127.0.0.1` and unreachable from any hosted runtime.
+
+---
+
 ## Useful scripts
 
 | Script | Description |
